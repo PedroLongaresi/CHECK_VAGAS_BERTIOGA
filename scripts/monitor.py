@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Monitor de Vagas - SESC Bertioga
+Monitor de Vagas - SESC Bertioga - v2 (login fix + debug)
 Verifica disponibilidade de hospedagem e notifica via Telegram
 """
 
 import os
-import sys
-import time
-import json
+import re
 import logging
 import requests
 from datetime import datetime
@@ -15,7 +13,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 # ── Configurações ────────────────────────────────────────────────────────────
 
-LOGIN_URL   = "https://portal.sescsp.org.br/meu-perfil/bertioga/login?fromUrl=https://reservabertioga.sescsp.org.br/bertioga-web/#/login"
+LOGIN_URL    = "https://portal.sescsp.org.br/meu-perfil/bertioga/login"
 RESERVAS_URL = "https://reservabertioga.sescsp.org.br/bertioga-web/#/reserva"
 
 SESC_EMAIL  = os.environ["SESC_EMAIL"]
@@ -23,8 +21,7 @@ SESC_SENHA  = os.environ["SESC_PASSWORD"]
 TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
-# Filtros opcionais (deixe vazio "" para não filtrar)
-FILTRO_MES  = os.environ.get("FILTRO_MES", "")   # ex: "julho", "agosto"
+FILTRO_MES  = os.environ.get("FILTRO_MES", "")
 FILTRO_ANO  = os.environ.get("FILTRO_ANO", "2026")
 
 logging.basicConfig(
@@ -42,10 +39,12 @@ def telegram_send(msg: str):
         "chat_id": TG_CHAT_ID,
         "text": msg,
         "parse_mode": "HTML",
-        "disable_web_page_preview": False,
+        "disable_web_page_preview": True,
     }
+    log.info(f"Enviando Telegram para chat_id: '{TG_CHAT_ID}'")
     try:
         r = requests.post(url, json=payload, timeout=15)
+        log.info(f"Resposta Telegram: {r.status_code} - {r.text[:300]}")
         r.raise_for_status()
         log.info("Mensagem enviada ao Telegram com sucesso.")
     except Exception as e:
@@ -75,36 +74,44 @@ def run_check():
             # ── 1. Login ──────────────────────────────────────────────────
             log.info("Abrindo página de login...")
             page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_selector("#logEmail", timeout=20_000)
+
+            log.info("Aguardando campo de email...")
+            page.wait_for_selector("#logEmail", timeout=30_000)
 
             page.fill("#logEmail", SESC_EMAIL)
             page.fill("#logPassword", SESC_SENHA)
-            page.click("#btnLogin")
 
-            # Aguarda redirecionamento pós-login
-            page.wait_for_url("**/bertioga-web/**", timeout=30_000)
-            log.info("Login realizado com sucesso.")
+            log.info("Clicando em login...")
+            # Não espera navegação específica — só aguarda o clique e dá tempo à SPA
+            page.click("#btnLogin")
+            page.wait_for_timeout(6000)
+            log.info(f"URL após login: {page.url}")
 
             # ── 2. Navega para Reservas ───────────────────────────────────
-            log.info("Navegando para página de reservas...")
+            log.info(f"Navegando para: {RESERVAS_URL}")
             page.goto(RESERVAS_URL, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(3000)  # SPA precisa de tempo para renderizar
+            page.wait_for_timeout(5000)
+            log.info(f"URL atual: {page.url}")
 
-            # ── 3. Seleciona ano 2026 (se necessário) ────────────────────
+            # ── 3. Screenshot e texto para debug ─────────────────────────
+            page.screenshot(path="debug_reservas.png")
+            log.info("Screenshot salvo: debug_reservas.png")
+
+            texto_pagina = page.inner_text("body")
+            log.info(f"Primeiros 800 chars da página:\n{texto_pagina[:800]}")
+
+            # ── 4. Seleciona ano (se necessário) ─────────────────────────
             if FILTRO_ANO:
                 try:
                     ano_btn = page.locator(f"span:text('{FILTRO_ANO}')").first
-                    if ano_btn.is_visible():
+                    if ano_btn.is_visible(timeout=5000):
                         ano_btn.click()
                         page.wait_for_timeout(2000)
                         log.info(f"Ano {FILTRO_ANO} selecionado.")
                 except Exception:
                     log.warning("Botão de ano não encontrado, continuando...")
 
-            # ── 4. Coleta todos os botões "Disponíveis" ───────────────────
-            page.wait_for_timeout(2000)
-
-            # Botões com texto "Disponíveis (N)"
+            # ── 5. Coleta botões "Disponíveis" ────────────────────────────
             btns = page.locator("button:has-text('Disponíveis')").all()
             log.info(f"Botões 'Disponíveis' encontrados: {len(btns)}")
 
@@ -113,13 +120,10 @@ def run_check():
                     texto = btn.inner_text().strip()
                     log.info(f"  → {texto}")
 
-                    # Extrai o número entre parênteses
-                    import re
                     match = re.search(r"\((\d+)\)", texto)
                     if match:
                         qtd = int(match.group(1))
                         if qtd > 0:
-                            # Tenta pegar contexto do período (elemento pai)
                             periodo = ""
                             try:
                                 container = btn.locator("xpath=ancestor::div[contains(@class,'periodo')]").first
@@ -127,30 +131,33 @@ def run_check():
                             except Exception:
                                 pass
 
-                            # Filtro por mês
                             if FILTRO_MES and FILTRO_MES.lower() not in periodo.lower():
-                                log.info(f"    Vaga fora do mês filtrado ({FILTRO_MES}), ignorando.")
+                                log.info(f"    Fora do filtro de mês ({FILTRO_MES}), ignorando.")
                                 continue
 
-                            vagas_encontradas.append({
-                                "qtd": qtd,
-                                "periodo": periodo or texto,
-                            })
+                            vagas_encontradas.append({"qtd": qtd, "periodo": periodo or texto})
                             log.info(f"    ✅ {qtd} vaga(s) disponível(is)!")
                 except Exception as e:
                     log.warning(f"Erro ao processar botão: {e}")
 
         except PlaywrightTimeout as e:
             log.error(f"Timeout: {e}")
+            try:
+                page.screenshot(path="debug_erro.png")
+                log.info("Screenshot de erro salvo.")
+            except Exception:
+                pass
             telegram_send(
                 "⚠️ <b>Monitor SESC</b>\n"
-                "Timeout ao carregar a página. Verifique se o site está no ar."
+                "Timeout ao carregar a página. O site pode estar lento ou fora do ar."
             )
         except Exception as e:
             log.error(f"Erro inesperado: {e}")
-            telegram_send(
-                f"⚠️ <b>Monitor SESC</b>\nErro inesperado: {str(e)[:200]}"
-            )
+            try:
+                page.screenshot(path="debug_erro.png")
+            except Exception:
+                pass
+            telegram_send(f"⚠️ <b>Monitor SESC</b>\nErro: {str(e)[:200]}")
         finally:
             browser.close()
 
@@ -159,8 +166,9 @@ def run_check():
 
 def main():
     log.info("=" * 55)
-    log.info("Monitor SESC Bertioga iniciando...")
+    log.info("Monitor SESC Bertioga v2 iniciando...")
     log.info(f"Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    log.info(f"Chat ID configurado: '{TG_CHAT_ID}'")
     if FILTRO_MES:
         log.info(f"Filtro de mês: {FILTRO_MES}")
     log.info("=" * 55)
@@ -175,14 +183,13 @@ def main():
         msg = (
             "🎉 <b>VAGA DISPONÍVEL NO SESC BERTIOGA!</b>\n\n"
             + "\n".join(linhas)
-            + f"\n\n🔗 <a href='{RESERVAS_URL}'>Clique aqui para reservar agora</a>\n"
-            f"⏰ Verificado em: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            + f"\n\n🔗 {RESERVAS_URL}\n"
+            f"⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
         )
         telegram_send(msg)
-        log.info(f"✅ {len(vagas)} período(s) com vagas encontrados!")
+        log.info(f"✅ {len(vagas)} período(s) com vagas!")
     else:
         log.info("❌ Nenhuma vaga disponível no momento.")
-        # Silencioso quando não há vagas (não envia mensagem)
 
 
 if __name__ == "__main__":
