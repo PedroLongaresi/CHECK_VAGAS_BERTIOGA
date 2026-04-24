@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
 """
-Monitor de Vagas - SESC Bertioga - v5
-Endpoints corretos: /periodo/ano/{ano}/mes/{mes}?tipo=COMPRA
-SSO: login no portal → handshake no bertioga → JSESSIONID válido
+Monitor de Vagas - SESC Bertioga - v6
+Fluxo SSO correto:
+  1. POST portal/login.action → dados do usuário
+  2. POST bertioga/usuario/meu-perfil/authenticate → JSESSIONID bertioga
+  3. GET bertioga/periodo/ano/{ano}/mes/{mes}?tipo=COMPRA → vagas
 """
 
 import os
 import re
+import json
 import logging
 import requests
 from datetime import datetime
 
 # ── Configurações ────────────────────────────────────────────────────────────
 
-PORTAL_LOGIN    = "https://portal.sescsp.org.br/meu-perfil/login.action"
-PORTAL_REFERER  = "https://portal.sescsp.org.br/meu-perfil/bertioga/login?fromUrl=https://reservabertioga.sescsp.org.br/bertioga-web/"
-# Página que faz o handshake SSO e gera JSESSIONID no domínio bertioga
-BERTIOGA_HOME   = "https://reservabertioga.sescsp.org.br/bertioga-web/"
-BERTIOGA_API    = "https://reservabertioga.sescsp.org.br/bertioga-web"
+PORTAL_LOGIN   = "https://portal.sescsp.org.br/meu-perfil/login.action"
+PORTAL_REFERER = "https://portal.sescsp.org.br/meu-perfil/bertioga/login?fromUrl=https://reservabertioga.sescsp.org.br/bertioga-web/"
 
-RESERVAS_URL    = "https://reservabertioga.sescsp.org.br/bertioga-web/#/reserva"
+BERTIOGA       = "https://reservabertioga.sescsp.org.br/bertioga-web"
+BERTIOGA_HOME  = f"{BERTIOGA}/"
+RESERVAS_URL   = f"{BERTIOGA}/#/reserva"
 
-SESC_EMAIL  = os.environ["SESC_EMAIL"]
-SESC_SENHA  = os.environ["SESC_PASSWORD"]
-TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+SESC_EMAIL = os.environ["SESC_EMAIL"]
+SESC_SENHA = os.environ["SESC_PASSWORD"]
+TG_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TG_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-FILTRO_MES  = os.environ.get("FILTRO_MES", "").lower()
-FILTRO_ANO  = int(os.environ.get("FILTRO_ANO", "2026"))
+FILTRO_MES = os.environ.get("FILTRO_MES", "").lower()
+FILTRO_ANO = int(os.environ.get("FILTRO_ANO", "2026"))
 
-# Meses para monitorar (1=jan ... 12=dez)
-# Se FILTRO_MES definido, tenta casar com o nome; senão monitora todos
 MESES_NOMES = {
     1:"janeiro",2:"fevereiro",3:"março",4:"abril",5:"maio",6:"junho",
     7:"julho",8:"agosto",9:"setembro",10:"outubro",11:"novembro",12:"dezembro"
@@ -52,29 +52,27 @@ UA = (
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
 def telegram_send(msg: str):
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TG_CHAT_ID, "text": msg,
-            "parse_mode": "HTML", "disable_web_page_preview": True
-        }, timeout=15)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": msg,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
         log.info(f"Telegram: {r.status_code} - {r.text[:200]}")
         r.raise_for_status()
     except Exception as e:
         log.error(f"Falha Telegram: {e}")
 
-# ── Autenticação SSO ──────────────────────────────────────────────────────────
+# ── SSO em 2 passos ───────────────────────────────────────────────────────────
 
 def criar_sessao() -> requests.Session:
     session = requests.Session()
-    session.headers.update({
-        "user-agent": UA,
-        "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8",
-    })
+    session.headers.update({"user-agent": UA, "accept-language": "pt-BR,pt;q=0.9"})
 
-    # 1. Login AJAX no portal
-    log.info("Passo 1: Login AJAX no portal...")
-    r = session.post(
+    # ── Passo 1: Login no portal ──────────────────────────────────────────────
+    log.info("Passo 1: Login no portal SESC...")
+    r1 = session.post(
         PORTAL_LOGIN,
         data={"email": SESC_EMAIL, "password": SESC_SENHA},
         headers={
@@ -85,45 +83,90 @@ def criar_sessao() -> requests.Session:
         },
         timeout=30,
     )
-    log.info(f"Login status: {r.status_code} | body: {r.text[:200]}")
-    if not r.ok or '"success":true' not in r.text:
-        raise Exception(f"Login falhou: {r.text[:200]}")
+    log.info(f"Login status: {r1.status_code} | body: {r1.text[:300]}")
 
-    portal_cookies = dict(session.cookies)
-    log.info(f"Cookies do portal: {list(portal_cookies.keys())}")
+    if not r1.ok:
+        raise Exception(f"Login falhou HTTP {r1.status_code}")
 
-    # 2. Acessa o bertioga-web passando os cookies do portal
-    # O bertioga valida a sessão via JSESSIONID do portal e cria sua própria sessão
-    log.info("Passo 2: Handshake SSO com bertioga-web...")
-    r2 = session.get(
-        BERTIOGA_HOME,
-        headers={"referer": PORTAL_REFERER},
-        timeout=30,
-        allow_redirects=True,
+    dados_portal = r1.json()
+    if not dados_portal.get("success"):
+        raise Exception(f"Login rejeitado: {r1.text[:200]}")
+
+    # ── Passo 2: Authenticate no bertioga com dados do portal ─────────────────
+    # O Angular faz exatamente esse POST após receber os dados do login
+    log.info("Passo 2: Authenticate no bertioga-web...")
+
+    # Busca dados completos do usuário no portal (o Angular faz isso antes do authenticate)
+    r_api = session.get(
+        f"https://portal.sescsp.org.br/meu-perfil/bertioga/usuario/meu-perfil/api",
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "referer": PORTAL_REFERER,
+        },
+        timeout=20,
     )
-    log.info(f"Bertioga home status: {r2.status_code} | URL final: {r2.url}")
-    log.info(f"Cookies após handshake: {list(session.cookies.keys())}")
+    log.info(f"API portal status: {r_api.status_code} | body: {r_api.text[:400]}")
 
-    # 3. Acessa o endpoint de usuário para confirmar sessão autenticada
-    log.info("Passo 3: Verificando sessão no bertioga...")
+    # Monta payload do authenticate — baseado exatamente no que o browser envia
+    # Se a API do portal não retornou dados completos, usa os dados do login
+    if r_api.ok:
+        try:
+            dados_usuario = r_api.json()
+        except Exception:
+            dados_usuario = {}
+    else:
+        dados_usuario = {}
+
+    # Garante campos obrigatórios que vimos no payload real
+    payload_auth = {
+        "success": True,
+        "id":      str(dados_portal.get("id", "")),
+        "nome":    dados_portal.get("name", ""),
+        "apelido": dados_portal.get("nickname", ""),
+        "email":   SESC_EMAIL,
+        # Campos extras do dados_usuario se disponíveis
+        "matriculado":     dados_usuario.get("matriculado", ""),
+        "numeroMatricula": dados_usuario.get("numeroMatricula", ""),
+        "cpf":             dados_usuario.get("cpf", ""),
+        "nascimento":      dados_usuario.get("nascimento", ""),
+        "genero":          dados_usuario.get("genero", ""),
+        "pais":            dados_usuario.get("pais", ""),
+        "estado":          dados_usuario.get("estado", ""),
+        "cidade":          dados_usuario.get("cidade", ""),
+    }
+    log.info(f"Payload authenticate: {json.dumps(payload_auth)[:300]}")
+
+    # Reseta cookies para o domínio bertioga antes do authenticate
+    session.cookies.clear_session_cookies()
+
+    r2 = session.post(
+        f"{BERTIOGA}/usuario/meu-perfil/authenticate",
+        json=payload_auth,
+        headers={
+            "accept": "application/json, text/plain, */*",
+            "content-type": "application/json",
+            "referer": BERTIOGA_HOME,
+        },
+        timeout=30,
+    )
+    log.info(f"Authenticate status: {r2.status_code} | body: {r2.text[:400]}")
+    log.info(f"Cookies após authenticate: {list(session.cookies.keys())}")
+    log.info(f"Cookies detalhados: { {c.name: c.value[:20] for c in session.cookies} }")
+
+    if r2.status_code not in (200, 201):
+        raise Exception(f"Authenticate falhou HTTP {r2.status_code}: {r2.text[:200]}")
+
+    # ── Passo 3: Confirma sessão ──────────────────────────────────────────────
+    log.info("Passo 3: Confirmando sessão...")
     r3 = session.get(
-        f"{BERTIOGA_API}/usuario",
-        headers={"accept": "application/json, text/plain, */*",
-                 "referer": BERTIOGA_HOME},
+        f"{BERTIOGA}/usuario",
+        headers={"accept": "application/json, text/plain, */*", "referer": BERTIOGA_HOME},
         timeout=20,
     )
     log.info(f"Usuario status: {r3.status_code} | body: {r3.text[:300]}")
 
     if r3.status_code == 401:
-        # Sessão não transferida — tenta via URL de autenticação explícita do bertioga
-        log.info("Sessão não transferida automaticamente. Tentando via /api/authenticate...")
-        r4 = session.get(
-            f"{BERTIOGA_API}/api/authenticate",
-            headers={"accept": "application/json, text/plain, */*",
-                     "referer": BERTIOGA_HOME},
-            timeout=20,
-        )
-        log.info(f"Authenticate status: {r4.status_code} | body: {r4.text[:300]}")
+        raise Exception("Sessão não autenticada após authenticate. Verifique os logs.")
 
     return session
 
@@ -132,15 +175,14 @@ def criar_sessao() -> requests.Session:
 def buscar_periodos(session: requests.Session) -> list:
     vagas = []
 
-    # Determina quais meses verificar
     mes_atual = datetime.now().month
     if FILTRO_MES:
         meses = [m for m, nome in MESES_NOMES.items() if FILTRO_MES in nome]
         if not meses:
-            log.warning(f"Mês '{FILTRO_MES}' não reconhecido, verificando todos.")
+            log.warning(f"Mês '{FILTRO_MES}' não reconhecido, usando mês atual em diante.")
             meses = list(range(mes_atual, 13))
     else:
-        meses = list(range(mes_atual, 13))  # do mês atual até dezembro
+        meses = list(range(mes_atual, 13))
 
     log.info(f"Verificando meses: {[MESES_NOMES[m] for m in meses]}")
 
@@ -151,46 +193,32 @@ def buscar_periodos(session: requests.Session) -> list:
 
     for mes in meses:
         for tipo in ("COMPRA", "SORTEIO"):
-            url = f"{BERTIOGA_API}/periodo/ano/{FILTRO_ANO}/mes/{mes}?tipo={tipo}"
+            url = f"{BERTIOGA}/periodo/ano/{FILTRO_ANO}/mes/{mes}?tipo={tipo}"
             log.info(f"GET {url}")
             try:
                 r = session.get(url, headers=headers_api, timeout=20)
-                log.info(f"  Status: {r.status_code} | body: {r.text[:400]}")
+                log.info(f"  Status: {r.status_code} | body: {r.text[:500]}")
 
                 if r.status_code != 200:
                     continue
 
                 data = r.json()
-                log.info(f"  JSON: {str(data)[:300]}")
-
-                # Processa resposta — pode ser lista ou dict
-                periodos = data if isinstance(data, list) else data.get("periodos") or data.get("data") or []
+                periodos = data if isinstance(data, list) else (
+                    data.get("periodos") or data.get("data") or []
+                )
 
                 for p in periodos:
                     if not isinstance(p, dict):
                         continue
-
-                    # Campos possíveis para quantidade disponível
-                    qtd = (
-                        p.get("quantidadeDisponivel") or
-                        p.get("vagasDisponiveis") or
-                        p.get("vagas") or
-                        p.get("disponivel") or
-                        p.get("quantidade") or 0
+                    qtd = int(
+                        p.get("quantidadeDisponivel") or p.get("vagasDisponiveis") or
+                        p.get("vagas") or p.get("disponivel") or p.get("quantidade") or 0
                     )
-                    try:
-                        qtd = int(qtd)
-                    except Exception:
-                        qtd = 0
-
                     nome = (
-                        p.get("descricao") or p.get("nome") or
-                        p.get("titulo") or p.get("periodo") or
+                        p.get("descricao") or p.get("nome") or p.get("titulo") or
                         f"{MESES_NOMES[mes].capitalize()}/{FILTRO_ANO}"
                     )
-
-                    log.info(f"  Período: {nome} | disponível: {qtd} | tipo: {tipo}")
-
+                    log.info(f"  → {nome} | disponível: {qtd} | tipo: {tipo}")
                     if qtd > 0:
                         vagas.append({"qtd": qtd, "periodo": nome, "tipo": tipo})
 
@@ -203,7 +231,7 @@ def buscar_periodos(session: requests.Session) -> list:
 
 def main():
     log.info("=" * 55)
-    log.info("Monitor SESC Bertioga v5 iniciando...")
+    log.info("Monitor SESC Bertioga v6 iniciando...")
     log.info(f"Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     if FILTRO_MES:
         log.info(f"Filtro de mês: {FILTRO_MES}")
