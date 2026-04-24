@@ -188,7 +188,13 @@ def main():
         telegram_send(msg)
         log.info(f"✅ {len(vagas)} período(s) com vagas!")
     else:
-        log.info("❌ Nenhuma vaga disponível no momento.")
+        msg = (
+            "ℹ️ <b>STATUS DE VAGAS SESC BERTIOGA</b>\n\n"
+            "Nenhuma vaga disponível no momento.\n\n"
+            f"🔗 {RESERVAS_URL}\n⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        )
+        telegram_send(msg)
+        log.info("❌ Nenhuma vaga disponível no momento. Notificação enviada.")
 
 if __name__ == "__main__":
     main()
