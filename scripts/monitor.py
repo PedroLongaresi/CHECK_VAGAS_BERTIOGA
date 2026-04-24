@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Monitor de Vagas - SESC Bertioga - v2 (login fix + debug)
-Verifica disponibilidade de hospedagem e notifica via Telegram
+Monitor de Vagas - SESC Bertioga - v4
+Login via AJAX direto (sem browser), muito mais leve e confiável.
 """
 
 import os
@@ -9,19 +9,23 @@ import re
 import logging
 import requests
 from datetime import datetime
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ── Configurações ────────────────────────────────────────────────────────────
 
-LOGIN_URL    = "https://portal.sescsp.org.br/meu-perfil/bertioga/login"
-RESERVAS_URL = "https://reservabertioga.sescsp.org.br/bertioga-web/#/reserva"
+LOGIN_ACTION = "https://portal.sescsp.org.br/meu-perfil/login.action"
+LOGIN_REFERER = "https://portal.sescsp.org.br/meu-perfil/bertioga/login?fromUrl=https://reservabertioga.sescsp.org.br/bertioga-web/"
+RESERVAS_URL  = "https://reservabertioga.sescsp.org.br/bertioga-web/#/reserva"
+
+# URL da API de períodos (SPA Angular carrega isso em background)
+API_PERIODOS = "https://reservabertioga.sescsp.org.br/bertioga-web/rest/periodos"
+API_BASE     = "https://reservabertioga.sescsp.org.br/bertioga-web/rest"
 
 SESC_EMAIL  = os.environ["SESC_EMAIL"]
 SESC_SENHA  = os.environ["SESC_PASSWORD"]
 TG_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TG_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
-FILTRO_MES  = os.environ.get("FILTRO_MES", "")
+FILTRO_MES  = os.environ.get("FILTRO_MES", "").lower()
 FILTRO_ANO  = os.environ.get("FILTRO_ANO", "2026")
 
 logging.basicConfig(
@@ -35,151 +39,168 @@ log = logging.getLogger(__name__)
 
 def telegram_send(msg: str):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    log.info(f"Enviando Telegram para chat_id: '{TG_CHAT_ID}'")
+    payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         r = requests.post(url, json=payload, timeout=15)
-        log.info(f"Resposta Telegram: {r.status_code} - {r.text[:300]}")
+        log.info(f"Telegram: {r.status_code} - {r.text[:300]}")
         r.raise_for_status()
-        log.info("Mensagem enviada ao Telegram com sucesso.")
     except Exception as e:
-        log.error(f"Falha ao enviar Telegram: {e}")
+        log.error(f"Falha Telegram: {e}")
 
-# ── Monitor principal ─────────────────────────────────────────────────────────
+# ── Sessão autenticada ────────────────────────────────────────────────────────
 
-def run_check():
-    vagas_encontradas = []
+def criar_sessao() -> requests.Session:
+    session = requests.Session()
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        page = ctx.new_page()
+    headers_login = {
+        "accept": "application/json, text/javascript, */*; q=0.01",
+        "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8",
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "x-requested-with": "XMLHttpRequest",
+        "referer": LOGIN_REFERER,
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/147.0.0.0 Safari/537.36"
+        ),
+    }
 
+    log.info("Fazendo login via AJAX...")
+    r = session.post(
+        LOGIN_ACTION,
+        data={"email": SESC_EMAIL, "password": SESC_SENHA},
+        headers=headers_login,
+        timeout=30,
+    )
+    log.info(f"Login response: {r.status_code}")
+    log.info(f"Login body: {r.text[:400]}")
+
+    if r.status_code != 200:
+        raise Exception(f"Login falhou com status {r.status_code}: {r.text[:200]}")
+
+    # Verifica se autenticou — a resposta costuma ter um JSON com sucesso ou redirect
+    body = r.text.lower()
+    if "senha" in body and "incorret" in body:
+        raise Exception("Login falhou — senha incorreta.")
+    if "erro" in body and "login" in body:
+        raise Exception(f"Login falhou: {r.text[:200]}")
+
+    log.info("Login realizado! Cookies obtidos:")
+    for c in session.cookies:
+        log.info(f"  {c.name} = {c.value[:30]}...")
+
+    return session
+
+# ── Busca vagas via API ───────────────────────────────────────────────────────
+
+def buscar_vagas(session: requests.Session) -> list:
+    vagas = []
+
+    headers_api = {
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "pt-BR,pt;q=0.9",
+        "referer": RESERVAS_URL,
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/147.0.0.0 Safari/537.36"
+        ),
+    }
+
+    # Tenta buscar a lista de períodos/reservas disponíveis
+    endpoints_tentar = [
+        f"{API_BASE}/periodos",
+        f"{API_BASE}/periodos/disponiveis",
+        f"{API_BASE}/reservas/periodos",
+        f"{API_BASE}/hospedagem/periodos",
+        f"{API_BASE}/distribuicao",
+    ]
+
+    for endpoint in endpoints_tentar:
+        log.info(f"Tentando endpoint: {endpoint}")
         try:
-            # ── 1. Login ──────────────────────────────────────────────────
-            log.info("Abrindo página de login...")
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60_000)
-
-            log.info("Aguardando campo de email...")
-            page.wait_for_selector("#logEmail", timeout=30_000)
-
-            page.fill("#logEmail", SESC_EMAIL)
-            page.fill("#logPassword", SESC_SENHA)
-
-            log.info("Clicando em login...")
-            # Não espera navegação específica — só aguarda o clique e dá tempo à SPA
-            page.click("#btnLogin")
-            page.wait_for_timeout(6000)
-            log.info(f"URL após login: {page.url}")
-
-            # ── 2. Navega para Reservas ───────────────────────────────────
-            log.info(f"Navegando para: {RESERVAS_URL}")
-            page.goto(RESERVAS_URL, wait_until="domcontentloaded", timeout=60_000)
-            page.wait_for_timeout(5000)
-            log.info(f"URL atual: {page.url}")
-
-            # ── 3. Screenshot e texto para debug ─────────────────────────
-            page.screenshot(path="debug_reservas.png")
-            log.info("Screenshot salvo: debug_reservas.png")
-
-            texto_pagina = page.inner_text("body")
-            log.info(f"Primeiros 800 chars da página:\n{texto_pagina[:800]}")
-
-            # ── 4. Seleciona ano (se necessário) ─────────────────────────
-            if FILTRO_ANO:
+            r = session.get(endpoint, headers=headers_api, timeout=20)
+            log.info(f"  Status: {r.status_code} | Content-Type: {r.headers.get('content-type','')}")
+            if r.status_code == 200:
+                log.info(f"  Body: {r.text[:500]}")
                 try:
-                    ano_btn = page.locator(f"span:text('{FILTRO_ANO}')").first
-                    if ano_btn.is_visible(timeout=5000):
-                        ano_btn.click()
-                        page.wait_for_timeout(2000)
-                        log.info(f"Ano {FILTRO_ANO} selecionado.")
-                except Exception:
-                    log.warning("Botão de ano não encontrado, continuando...")
-
-            # ── 5. Coleta botões "Disponíveis" ────────────────────────────
-            btns = page.locator("button:has-text('Disponíveis')").all()
-            log.info(f"Botões 'Disponíveis' encontrados: {len(btns)}")
-
-            for btn in btns:
-                try:
-                    texto = btn.inner_text().strip()
-                    log.info(f"  → {texto}")
-
-                    match = re.search(r"\((\d+)\)", texto)
-                    if match:
-                        qtd = int(match.group(1))
-                        if qtd > 0:
-                            periodo = ""
-                            try:
-                                container = btn.locator("xpath=ancestor::div[contains(@class,'periodo')]").first
-                                periodo = container.inner_text()[:120].strip().replace("\n", " | ")
-                            except Exception:
-                                pass
-
-                            if FILTRO_MES and FILTRO_MES.lower() not in periodo.lower():
-                                log.info(f"    Fora do filtro de mês ({FILTRO_MES}), ignorando.")
-                                continue
-
-                            vagas_encontradas.append({"qtd": qtd, "periodo": periodo or texto})
-                            log.info(f"    ✅ {qtd} vaga(s) disponível(is)!")
+                    data = r.json()
+                    vagas = processar_json(data)
+                    if vagas is not None:
+                        log.info(f"  ✅ Endpoint funcionou! {len(vagas)} vaga(s) encontrada(s).")
+                        return vagas
                 except Exception as e:
-                    log.warning(f"Erro ao processar botão: {e}")
-
-        except PlaywrightTimeout as e:
-            log.error(f"Timeout: {e}")
-            try:
-                page.screenshot(path="debug_erro.png")
-                log.info("Screenshot de erro salvo.")
-            except Exception:
-                pass
-            telegram_send(
-                "⚠️ <b>Monitor SESC</b>\n"
-                "Timeout ao carregar a página. O site pode estar lento ou fora do ar."
-            )
+                    log.info(f"  Não é JSON válido: {e}")
         except Exception as e:
-            log.error(f"Erro inesperado: {e}")
-            try:
-                page.screenshot(path="debug_erro.png")
-            except Exception:
-                pass
-            telegram_send(f"⚠️ <b>Monitor SESC</b>\nErro: {str(e)[:200]}")
-        finally:
-            browser.close()
+            log.warning(f"  Erro: {e}")
 
-    return vagas_encontradas
+    log.warning("Nenhum endpoint de API funcionou — veja os logs acima para descobrir a URL correta.")
+    return []
 
+
+def processar_json(data) -> list | None:
+    """
+    Tenta extrair vagas disponíveis do JSON retornado pela API.
+    Retorna lista de vagas ou None se o formato não for reconhecido.
+    """
+    vagas = []
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                qtd = (
+                    item.get("quantidadeDisponivel")
+                    or item.get("vagas")
+                    or item.get("disponivel")
+                    or item.get("quantidade")
+                    or 0
+                )
+                try:
+                    qtd = int(qtd)
+                except Exception:
+                    qtd = 0
+
+                if qtd > 0:
+                    periodo = (
+                        item.get("descricao")
+                        or item.get("periodo")
+                        or item.get("nome")
+                        or str(item)[:80]
+                    )
+                    if FILTRO_MES and FILTRO_MES not in periodo.lower():
+                        continue
+                    vagas.append({"qtd": qtd, "periodo": periodo})
+        return vagas
+
+    if isinstance(data, dict):
+        # Tenta chaves comuns
+        for chave in ("periodos", "reservas", "itens", "data", "result", "results"):
+            if chave in data and isinstance(data[chave], list):
+                return processar_json(data[chave])
+
+    return None  # formato desconhecido
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     log.info("=" * 55)
-    log.info("Monitor SESC Bertioga v2 iniciando...")
+    log.info("Monitor SESC Bertioga v4 (API direta) iniciando...")
     log.info(f"Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-    log.info(f"Chat ID configurado: '{TG_CHAT_ID}'")
     if FILTRO_MES:
         log.info(f"Filtro de mês: {FILTRO_MES}")
     log.info("=" * 55)
 
-    vagas = run_check()
+    try:
+        session = criar_sessao()
+        vagas = buscar_vagas(session)
+    except Exception as e:
+        log.error(f"Erro crítico: {e}")
+        telegram_send(f"⚠️ <b>Monitor SESC</b>\nErro: {str(e)[:300]}")
+        return
 
     if vagas:
-        linhas = []
-        for v in vagas:
-            linhas.append(f"  • <b>{v['qtd']} vaga(s)</b> → {v['periodo']}")
-
+        linhas = [f"  • <b>{v['qtd']} vaga(s)</b> → {v['periodo']}" for v in vagas]
         msg = (
             "🎉 <b>VAGA DISPONÍVEL NO SESC BERTIOGA!</b>\n\n"
             + "\n".join(linhas)
@@ -189,7 +210,7 @@ def main():
         telegram_send(msg)
         log.info(f"✅ {len(vagas)} período(s) com vagas!")
     else:
-        log.info("❌ Nenhuma vaga disponível no momento.")
+        log.info("❌ Nenhuma vaga disponível (ou API ainda não mapeada — veja logs).")
 
 
 if __name__ == "__main__":

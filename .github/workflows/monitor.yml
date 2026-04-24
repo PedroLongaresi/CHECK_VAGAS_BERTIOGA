@@ -2,43 +2,63 @@ name: 🏖️ Monitor SESC Bertioga
 
 on:
   schedule:
-    # Roda a cada 15 minutos entre 7h e 23h (horário de Brasília = UTC-3)
-    # GitHub Actions usa UTC, então 7h BRT = 10h UTC, 23h BRT = 02h UTC
     - cron: "0,15,30,45 10-23 * * *"   # 07:00–20:45 BRT
     - cron: "0,15,30,45 0-2  * * *"    # 21:00–23:45 BRT
-  workflow_dispatch:                    # Permite rodar manualmente pelo GitHub
+    - cron: "0 3 * * *"                # 00:00 BRT — heartbeat diário
+  workflow_dispatch:
 
 jobs:
   verificar-vagas:
     name: Verificar vagas
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
 
     steps:
-      # ── 1. Código ──────────────────────────────────────────────────────────
       - name: 📥 Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python ─────────────────────────────────────────────────────────
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      # ── 3. Dependências ───────────────────────────────────────────────────
       - name: 📦 Instalar dependências
-        run: |
-          pip install playwright requests
-          playwright install chromium --with-deps
+        run: pip install requests
 
-      # ── 4. Executar monitor ───────────────────────────────────────────────
+      - name: 💓 Heartbeat diário (meia-noite BRT)
+        if: github.event.schedule == '0 3 * * *' || github.event_name == 'workflow_dispatch'
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PYEOF'
+          import os, requests
+          from datetime import datetime, timedelta
+          token   = os.environ["TELEGRAM_TOKEN"]
+          chat_id = os.environ["TELEGRAM_CHAT_ID"]
+          brt = datetime.utcnow() - timedelta(hours=3)
+          msg = (
+              "💓 <b>Monitor SESC – Relatório diário</b>\n\n"
+              "✅ Estou funcionando normalmente!\n"
+              f"⏰ Meia-noite de {brt.strftime('%d/%m/%Y')}\n\n"
+              "Verifico vagas a cada 15 min das 7h às 23h45.\n"
+              "Você só recebe mensagem quando aparecer vaga. 🏖️"
+          )
+          r = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+              timeout=15,
+          )
+          print(f"Heartbeat: {r.status_code} - {r.text[:200]}")
+          PYEOF
+
       - name: 🔍 Verificar vagas no SESC
         env:
-          SESC_EMAIL:      ${{ secrets.SESC_EMAIL }}
-          SESC_PASSWORD:   ${{ secrets.SESC_PASSWORD }}
-          TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
+          SESC_EMAIL:       ${{ secrets.SESC_EMAIL }}
+          SESC_PASSWORD:    ${{ secrets.SESC_PASSWORD }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          FILTRO_MES:      ${{ vars.FILTRO_MES }}   # Opcional: "julho", "agosto"...
-          FILTRO_ANO:      "2026"
+          FILTRO_MES:       ${{ vars.FILTRO_MES }}
+          FILTRO_ANO:       "2026"
         run: python scripts/monitor.py
