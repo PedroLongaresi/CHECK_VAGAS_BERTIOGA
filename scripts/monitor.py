@@ -181,7 +181,7 @@ def main():
     if vagas:
         linhas = [f"  • <b>{v['qtd']} vaga(s)</b> [{v['tipo']}] → {v['periodo']}" for v in vagas]
         msg = (
-            "🎉 <b>VAGA DISPONÍVEL NO SESC BERTIOGA!</b>\n\n"
+            "🎉 <b>✅ VAGA DISPONÍVEL NO SESC BERTIOGA!</b>\n\n"
             + "\n".join(linhas)
             + f"\n\n🔗 {RESERVAS_URL}\n⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
         )
@@ -189,7 +189,7 @@ def main():
         log.info(f"✅ {len(vagas)} período(s) com vagas!")
     else:
         msg = (
-            "ℹ️ <b>STATUS DE VAGAS SESC BERTIOGA</b>\n\n"
+            "❌ <b>STATUS DE VAGAS SESC BERTIOGA</b>\n\n"
             "Nenhuma vaga disponível no momento.\n\n"
             f"🔗 {RESERVAS_URL}\n⏰ {datetime.now().strftime('%d/%m/%Y %H:%M')}"
         )
