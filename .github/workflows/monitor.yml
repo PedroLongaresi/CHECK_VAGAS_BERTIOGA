@@ -2,8 +2,8 @@ name: 🏖️ Monitor SESC Bertioga
 
 on:
   schedule:
-    - cron: "0,15,30,45 10-23 * * *"   # 07:00–20:45 BRT
-    - cron: "0,15,30,45 0-2  * * *"    # 21:00–23:45 BRT
+    - cron: "0,20,40 9-23 * * *"   # 06:00–20:00 BRT
+    - cron: "0,20,40 0-5  * * *"    # 21:00–02:00 BRT
     - cron: "0 3 * * *"                # 00:00 BRT — heartbeat diário
   workflow_dispatch:
 
@@ -42,7 +42,7 @@ jobs:
               "💓 <b>Monitor SESC – Relatório diário</b>\n\n"
               "✅ Estou funcionando normalmente!\n"
               f"⏰ Meia-noite de {brt.strftime('%d/%m/%Y')}\n\n"
-              "Verifico vagas a cada 15 min das 7h às 23h45.\n"
+              "Verifico vagas a cada 20 min das 6h às 2h.\n"
               "Você só recebe mensagem quando aparecer vaga. 🏖️"
           )
           r = requests.post(
