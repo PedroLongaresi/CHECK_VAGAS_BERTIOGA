@@ -5,9 +5,9 @@ env:
 
 on:
   schedule:
-    - cron: "*/20 9-23 * * *"   # 06:00–20:00 BRT
-    - cron: "*/20 0-5  * * *"    # 21:00–02:00 BRT (d+1)
-    - cron: "0 3 * * *"                # 00:00 BRT — heartbeat diário
+    - cron: "*/20 8-23 * * *"   # 05:00–20:59 BRT  (UTC 08h–23h)
+    - cron: "*/20 0-6  * * *"   # 21:00–03:00 BRT  (UTC 00h–06h)
+    - cron: "0 3 * * *"         # heartbeat 00:00 BRT
   workflow_dispatch:
 
 jobs:
