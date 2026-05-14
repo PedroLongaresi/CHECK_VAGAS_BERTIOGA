@@ -4,10 +4,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 on:
-  schedule:
-    - cron: "*/20 8-23 * * *"   # 05:00–20:59 BRT  (UTC 08h–23h)
-    - cron: "*/20 0-6  * * *"   # 21:00–03:00 BRT  (UTC 00h–06h)
-    - cron: "0 3 * * *"         # heartbeat 00:00 BRT
+  # schedule:
+  #   - cron: "*/20 8-23 * * *"   # 05:00–20:59 BRT  (UTC 08h–23h)
+  #   - cron: "*/20 0-6  * * *"   # 21:00–03:00 BRT  (UTC 00h–06h)
+  #   - cron: "0 3 * * *"         # heartbeat 00:00 BRT
   workflow_dispatch:
 
 jobs:
